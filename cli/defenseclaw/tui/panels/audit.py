@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -556,6 +557,11 @@ class AuditPanelModel:
             ("Severity", event.severity),
             ("Actor", event.actor),
         ]
+        if isinstance(event.structured, dict):
+            openclaw_agent_id = event.structured.get("openclaw_agent_id")
+            # Match M3.1's bounded ID format; never render arbitrary metadata.
+            if isinstance(openclaw_agent_id, str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", openclaw_agent_id):
+                pairs.append(("OpenClaw Agent", openclaw_agent_id))
         if event.details:
             structured = _structured_detail_rows(event.details)
             if structured:
