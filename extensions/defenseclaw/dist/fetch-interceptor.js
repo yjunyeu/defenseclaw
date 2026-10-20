@@ -39,22 +39,41 @@ const _require = createRequire(import.meta.url);
 const https = _require("https");
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const http = _require("http");
-/**
- * Domains that should be intercepted. Seeded from the embedded
- * providers.json at import time; can be extended at runtime by
- * `bootstrapProviderOverlay()` once the sidecar's
- * GET /v1/config/providers endpoint is reachable. Declared `let` so
- * the overlay can grow the list in place without the rest of the
- * module holding a stale snapshot.
- */
-let LLM_DOMAINS = providersConfig.providers.flatMap((p) => p.domains);
-/**
- * Ollama runs locally — intercept by matching its default port.
- * Seeded from providers.json; can be extended at runtime by the
- * overlay fetch so new Ollama deployments on non-standard ports do
- * not silently bypass the guardrail.
- */
-let OLLAMA_PORTS = providersConfig.ollama_ports.map(String);
+// undici — Node 18+ backs globalThis.fetch with undici's internal dispatcher.
+// SDKs that capture the pre-patch fetch reference or call undici.request()
+// directly bypass globalThis.fetch / https.request patches entirely.
+let undici = null;
+try {
+    undici = _require("undici");
+}
+catch {
+    // undici not bundled (older Node or stripped runtime) — skip
+}
+// ─── Shared cross-instance state ───
+// The plugin .js may be evaluated in multiple V8 contexts (e.g.
+// [gateway] + [plugins] in OpenClaw). Each evaluation creates its
+// own module-scoped variables. Using a well-known globalThis slot
+// ensures all instances share one canonical domain/port list and
+// only one instance installs the transport patch.
+const INTERCEPTOR_STATE_KEY = Symbol.for("defenseclaw.interceptor.state");
+function getOrCreateSharedState() {
+    const existing = globalThis[INTERCEPTOR_STATE_KEY];
+    if (existing)
+        return existing;
+    const state = {
+        llmDomains: providersConfig.providers.flatMap((p) => p.domains),
+        ollamaPorts: providersConfig.ollama_ports.map(String),
+        installed: false,
+        guardrailPort: null,
+    };
+    globalThis[INTERCEPTOR_STATE_KEY] = state;
+    return state;
+}
+const _shared = getOrCreateSharedState();
+// Module-level aliases that point into shared state so existing code
+// (isLLMUrl, applyProviderRegistry, etc.) continues to work unchanged.
+let LLM_DOMAINS = _shared.llmDomains;
+let OLLAMA_PORTS = _shared.ollamaPorts;
 /**
  * Apply a merged provider registry from the Go sidecar. Additive
  * only — we never drop a built-in domain or port because the
@@ -831,6 +850,7 @@ export function createFetchInterceptor(portOrOpts) {
     let originalHttpsRequest = null;
     let originalHttpRequest = null;
     let originalHttpGet = null;
+    let originalUndiciDispatcher = null;
     let egressReporter = null;
     let chatgptCodexPassthroughWarned = false;
     // Extract { host, path } from a URL string without throwing. Missing
@@ -867,7 +887,19 @@ export function createFetchInterceptor(portOrOpts) {
     }
     function start() {
         if (originalFetch)
-            return; // already started
+            return; // this instance already started
+        // Idempotent cross-instance guard: if another module evaluation
+        // already patched the transport, we only bootstrap the overlay
+        // (so our operator-added domains merge into the shared list) and
+        // return without re-wrapping fetch/https/http/undici.
+        if (_shared.installed) {
+            void bootstrapProviderOverlay(guardrailPort, {
+                fetchImpl: globalThis.fetch,
+            });
+            return;
+        }
+        _shared.installed = true;
+        _shared.guardrailPort = guardrailPort;
         originalFetch = globalThis.fetch;
         egressReporter = createEgressReporter({ guardrailPort });
         // Layer 4 (governance): pull the sidecar's merged provider
@@ -969,8 +1001,10 @@ export function createFetchInterceptor(portOrOpts) {
             });
             return response;
         };
-        // Also patch https.request so axios, undici, and other non-fetch HTTP
-        // clients are intercepted. All of them ultimately use node:https.request.
+        // Also patch https.request so axios and other HTTP clients that
+        // delegate to node:https are intercepted. Note: undici-based clients
+        // (including Node 18+ globalThis.fetch) are covered by the undici
+        // dispatcher patch above, not this https.request patch.
         originalHttpsRequest = https.request.bind(https);
         originalHttpRequest = http.request.bind(http);
         originalHttpGet = http.get.bind(http);
@@ -1204,15 +1238,23 @@ export function createFetchInterceptor(portOrOpts) {
         // get rewritten to "https:".
         function patchedHttpRequest(urlOrOptions, optionsOrCallback, callback) {
             const urlStr = buildUrlStringFromArgs(urlOrOptions, optionsOrCallback);
-            // Only re-route if the request shape would otherwise hit a
-            // local Ollama instance. For any other http.request path we
-            // pass through to the captured original to avoid breaking
-            // unrelated http traffic.
-            const ollamaCandidate = Boolean(urlStr &&
+            // Layer 0: known provider domain or registered local LLM port
+            // with a recognizable LLM path (original Ollama-only gate).
+            const knownCandidate = Boolean(urlStr &&
                 isLLMUrl(urlStr, guardrailPort) &&
                 hasLLMPathSuffix(urlStr) &&
                 !isAlreadyProxied(urlStr, guardrailPort));
-            if (!ollamaCandidate) {
+            // Layer 1: path-shape detection — catches local LLM proxies
+            // (e.g. http://127.0.0.1:18800/v1/chat/completions) that are
+            // not registered in ollama_ports but have a recognizable LLM
+            // path suffix. Only applies to non-safe domains so we don't
+            // accidentally intercept unrelated http traffic.
+            const shapedCandidate = Boolean(urlStr &&
+                !knownCandidate &&
+                !isKnownSafeDomain(urlStr) &&
+                !isAlreadyProxied(urlStr, guardrailPort) &&
+                hasLLMPathSuffix(urlStr));
+            if (!knownCandidate && !shapedCandidate) {
                 return originalHttpRequest(urlOrOptions, optionsOrCallback, callback);
             }
             // Re-use the https.request patched path. The proxy hop is
@@ -1236,6 +1278,50 @@ export function createFetchInterceptor(portOrOpts) {
             return req;
         }
         http.get = patchedHttpGet;
+        // ─── Undici dispatcher interception ───
+        // Node 18+ globalThis.fetch is backed by undici's internal
+        // dispatcher. If a SDK (e.g. @anthropic-ai/sdk, openai v4+)
+        // captured the original globalThis.fetch reference before our
+        // swap, or calls undici.request()/fetch() directly, traffic
+        // bypasses our globalThis.fetch patch. Intercepting at the
+        // dispatcher level catches ALL undici-routed traffic.
+        if (undici &&
+            typeof undici.getGlobalDispatcher === "function" &&
+            typeof undici.setGlobalDispatcher === "function") {
+            originalUndiciDispatcher = undici.getGlobalDispatcher();
+            const parentDispatcher = originalUndiciDispatcher;
+            const interceptingDispatch = (opts, handler) => {
+                const origin = opts.origin?.toString() ?? "";
+                const pathStr = opts.path ?? "";
+                const urlStr = origin + pathStr;
+                if (urlStr &&
+                    !isAlreadyProxied(urlStr, guardrailPort) &&
+                    !isKnownSafeDomain(urlStr) &&
+                    (isLLMUrl(urlStr, guardrailPort) || hasLLMPathSuffix(urlStr))) {
+                    opts.origin = proxyBase;
+                    const existingHeaders = (opts.headers ?? {});
+                    const providerKey = extractProviderKeyFromRecord(existingHeaders);
+                    const proxyHdrs = buildProxyHeaders(origin + pathStr, providerKey, getCorrelationHeaders);
+                    opts.headers = { ...existingHeaders, ...proxyHdrs };
+                    egressReporter?.report({
+                        targetHost: new URL(origin).hostname,
+                        targetPath: pathStr,
+                        bodyShape: "none",
+                        looksLikeLLM: true,
+                        branch: "undici",
+                        decision: "intercept",
+                        reason: "undici-dispatcher",
+                    });
+                }
+                return parentDispatcher.dispatch(opts, handler);
+            };
+            // Proxy object that delegates dispatch to our interceptor and
+            // all other Dispatcher methods to the original.
+            const proxyDispatcher = Object.create(parentDispatcher, {
+                dispatch: { value: interceptingDispatch, writable: true, configurable: true },
+            });
+            undici.setGlobalDispatcher(proxyDispatcher);
+        }
         console.log(`[defenseclaw] LLM fetch interceptor active (proxy: ${proxyBase})`);
     }
     function stop() {
@@ -1258,11 +1344,18 @@ export function createFetchInterceptor(portOrOpts) {
             http.get = originalHttpGet;
             originalHttpGet = null;
         }
+        // Restore undici global dispatcher
+        if (undici && originalUndiciDispatcher) {
+            undici.setGlobalDispatcher(originalUndiciDispatcher);
+            originalUndiciDispatcher = null;
+        }
         if (egressReporter) {
             egressReporter.stop();
             egressReporter = null;
         }
         chatgptCodexPassthroughWarned = false;
+        _shared.installed = false;
+        _shared.guardrailPort = null;
         console.log("[defenseclaw] LLM fetch interceptor stopped");
     }
     return { start, stop };
