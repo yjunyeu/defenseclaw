@@ -208,6 +208,8 @@ export interface CorrelationContext {
   sessionId?: string;
   /** Logical agent id for `X-DefenseClaw-Agent-Id` (config, env, or persisted stable id). */
   agentId: string;
+  /** Per-tool-call OpenClaw execution agent; connector-reported metadata, never authorization. */
+  openclawAgentId?: string;
   /** Per–extension-session instance id minted by the plugin; may converge with the sidecar echo. */
   agentInstanceId?: string;
   /** Echoed from the sidecar (`X-DefenseClaw-Sidecar-Instance-Id` response header). */

@@ -1353,6 +1353,7 @@ func (a *APIServer) handleInspectTool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Connector = serverConnector
+	r = r.WithContext(contextWithOpenClawToolIdentity(r.Context(), r.Header, serverConnector))
 
 	scanTimeout := inspectScanTimeout
 	if a.inspectToolScanTimeout > 0 {
@@ -1484,7 +1485,16 @@ func (a *APIServer) handleInspectTool(w http.ResponseWriter, r *http.Request) {
 		auditDetails += fmt.Sprintf(" request_id=%s", requestID)
 	}
 	auditDetails = appendHookEvaluationDetails(auditDetails, evalCtx)
-	_ = a.logger.LogActionCtx(r.Context(), auditAction, req.Tool, auditDetails)
+	var structured map[string]any
+	if id := OpenClawAgentIDFromContext(r.Context()); id != "" {
+		// Durable attribution only. Keep caller-reported identity out of policy
+		// inputs and preserve the existing logical agent/correlation envelope.
+		structured = map[string]any{"openclaw_agent_id": id}
+	}
+	_ = a.logger.LogEventCtx(r.Context(), audit.Event{
+		Action: auditAction, Target: req.Tool, Details: auditDetails,
+		Severity: "INFO", Structured: structured,
+	})
 
 	a.emitCodeGuardTelemetry(r.Context(), &req, verdict, elapsed)
 

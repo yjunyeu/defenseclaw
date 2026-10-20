@@ -25,6 +25,7 @@ export const HEADER_DEFENSECLAW_RUN_ID = "X-DefenseClaw-Run-Id";
 export const HEADER_DEFENSECLAW_SESSION_ID = "X-DefenseClaw-Session-Id";
 export const HEADER_DEFENSECLAW_TRACE_ID = "X-DefenseClaw-Trace-Id";
 export const HEADER_DEFENSECLAW_AGENT_ID = "X-DefenseClaw-Agent-Id";
+export const HEADER_DEFENSECLAW_OPENCLAW_AGENT_ID = "X-DefenseClaw-OpenClaw-Agent-Id";
 export const HEADER_DEFENSECLAW_AGENT_INSTANCE_ID = "X-DefenseClaw-Agent-Instance-Id";
 export const HEADER_DEFENSECLAW_SIDECAR_INSTANCE_ID = "X-DefenseClaw-Sidecar-Instance-Id";
 export const HEADER_DEFENSECLAW_AGENT_NAME = "X-DefenseClaw-Agent-Name";
@@ -60,6 +61,18 @@ export function buildSidecarCorrelationHeaders(
   setIfPresent(out, HEADER_DEFENSECLAW_SESSION_ID, ctx.sessionId);
   setIfPresent(out, HEADER_DEFENSECLAW_TRACE_ID, ctx.traceId);
   setIfPresent(out, HEADER_DEFENSECLAW_AGENT_ID, ctx.agentId);
+  // OpenClaw's canonical agent IDs are bounded ASCII identifiers. Drop invalid
+  // metadata rather than making an otherwise valid inspection fail transport.
+  // Do not normalize or substitute the DefenseClaw logical plugin identity.
+  const openclawAgentId = ctx.openclawAgentId;
+  if (
+    typeof openclawAgentId === "string" &&
+    openclawAgentId.length <= 64 &&
+    /^[a-z0-9]/.test(openclawAgentId) &&
+    !/[^a-z0-9_-]/.test(openclawAgentId)
+  ) {
+    out[HEADER_DEFENSECLAW_OPENCLAW_AGENT_ID] = openclawAgentId;
+  }
   setIfPresent(out, HEADER_DEFENSECLAW_AGENT_NAME, ctx.agentName);
   setIfPresent(out, HEADER_DEFENSECLAW_POLICY_ID, ctx.policyId);
   setIfPresent(

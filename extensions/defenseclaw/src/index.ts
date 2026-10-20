@@ -363,6 +363,9 @@ export default function (api: DefenseClawPluginHost) {
     toolCtx?: ToolContext,
   ): Promise<InspectVerdict> {
     const sessionId = toolCtx?.sessionId ?? toolCtx?.sessionKey;
+    // Capture before awaiting: this belongs to this invocation, including the
+    // message branch, never the plugin identity or last-seen LLM context.
+    const openclawAgentId = toolCtx?.agentId;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), INSPECT_TIMEOUT_MS);
     const started = performance.now();
@@ -370,6 +373,7 @@ export default function (api: DefenseClawPluginHost) {
       const base = await daemonClient.buildOutboundHeaders({
         runId: toolCtx?.runId,
         sessionId,
+        openclawAgentId,
       });
       const headers: Record<string, string> = {
         ...base,

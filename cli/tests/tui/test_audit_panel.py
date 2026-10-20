@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from defenseclaw.db import Store
 from defenseclaw.models import ActionState, Event
 from defenseclaw.tui.panels.audit import (
@@ -91,6 +92,136 @@ def new_store(tmp_path: Path) -> Store:
     store = Store(str(tmp_path / "audit.db"))
     store.init()
     return store
+
+
+@pytest.mark.parametrize("agent_id", ["medical", "work", "agent_2-test", "a" * 64])
+def test_audit_openclaw_agent_detail_preserves_existing_rows(agent_id: str) -> None:
+    panel = AuditPanelModel()
+    panel.show_all_events = True
+    event = Event(
+        id="event-tool",
+        timestamp=datetime(2026, 10, 20, 12, 0, 0),
+        action="inspect-tool-allow",
+        target="read",
+        actor="defenseclaw",
+        severity="INFO",
+        details="raw_action=allow mode=observe elapsed=12ms",
+        run_id="run-tool",
+    )
+    panel.set_events([event])
+    historical_pairs = panel.detail_pairs()
+    assert historical_pairs == (
+        ("Time", "2026-10-20T12:00:00"),
+        ("Event ID", "event-tool"),
+        ("Action", "inspect-tool-allow"),
+        ("Target", "read"),
+        ("Severity", "INFO"),
+        ("Actor", "defenseclaw"),
+        ("Decision (raw)", "allow"),
+        ("Enforcement mode", "observe"),
+        ("Elapsed", "12ms"),
+        ("Run ID", "run-tool"),
+    )
+
+    event.structured = {
+        "openclaw_agent_id": agent_id,
+        "agent_id": "logical-plugin-identity",
+        "tool_args": {"content": "synthetic private tool argument"},
+    }
+    panel.set_events([event])
+    pairs = panel.detail_pairs()
+    actor_index = pairs.index(("Actor", "defenseclaw"))
+    assert pairs[actor_index + 1] == ("OpenClaw Agent", agent_id)
+    assert tuple(pair for pair in pairs if pair[0] != "OpenClaw Agent") == historical_pairs
+    assert any(row.label == "OpenClaw Agent" and row.value == agent_id for row in panel.detail_rows())
+
+    panel.detail_open = True
+    rendered = panel.render_text()
+    assert f"OpenClaw Agent: {agent_id}" in rendered
+    assert "logical-plugin-identity" not in rendered
+    assert "synthetic private tool argument" not in rendered
+
+
+@pytest.mark.parametrize(
+    "structured",
+    [
+        None, [], "not a dictionary", {}, {"agent_id": "logical-plugin-identity"},
+        {"openclaw_agent_id": None}, {"openclaw_agent_id": 123},
+        {"openclaw_agent_id": True}, {"openclaw_agent_id": ["medical"]},
+        {"openclaw_agent_id": {"name": "medical"}}, {"openclaw_agent_id": ""},
+        {"openclaw_agent_id": "   "}, {"openclaw_agent_id": " medical "},
+        {"openclaw_agent_id": "medical\ninjected"},
+        {"openclaw_agent_id": "\x1b[31mmedical"},
+        {"openclaw_agent_id": "[bold]medical[/]"},
+        {"openclaw_agent_id": "médical"}, {"openclaw_agent_id": "Medical"},
+        {"openclaw_agent_id": "-medical"}, {"openclaw_agent_id": "a" * 65},
+    ],
+)
+def test_audit_missing_or_malformed_openclaw_agent_detail_is_omitted(structured) -> None:
+    panel = AuditPanelModel()
+    panel.show_all_events = True
+    panel.set_events([
+        Event(id="event-tool", action="inspect-tool-allow", target="read", structured=structured),
+    ])
+    panel.detail_open = True
+
+    pairs = dict(panel.detail_pairs())
+    assert pairs["Actor"] == "defenseclaw"
+    assert pairs["Target"] == "read"
+    assert "OpenClaw Agent" not in pairs
+    assert "OpenClaw Agent:" not in panel.render_text()
+
+
+def test_audit_selected_event_loads_openclaw_agent_from_sqlite(tmp_path: Path) -> None:
+    store = new_store(tmp_path)
+    try:
+        expected = {"event-medical": "medical", "event-work": "work"}
+        for event_id, agent_id in expected.items():
+            store.log_event(Event(
+                id=event_id,
+                action="inspect-tool-allow",
+                target="read",
+                structured={"openclaw_agent_id": agent_id},
+                severity="INFO",
+            ))
+        panel = AuditPanelModel(store=store)
+        panel.show_all_events = True
+        panel.refresh()
+        assert len(panel.filtered) == 2
+
+        for index in (0, 1, 0):
+            panel.set_cursor(index)
+            summary = panel.selected()
+            assert summary is not None
+            assert summary.structured == {}
+            info = panel.get_detail_info()
+            assert info is not None
+            assert info.event.structured == {"openclaw_agent_id": expected[summary.id]}
+            assert ("OpenClaw Agent", expected[summary.id]) in panel.detail_pairs()
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("structured_json", [None, "", "not json", "null", "[]", '"medical"'])
+def test_audit_selected_event_tolerates_malformed_structured_json(tmp_path: Path, structured_json) -> None:
+    store = new_store(tmp_path)
+    try:
+        store.log_event(Event(id="event-tool", action="inspect-tool-allow", target="read", severity="INFO"))
+        store.db.execute(
+            "UPDATE audit_events SET structured_json = ? WHERE id = ?",
+            (structured_json, "event-tool"),
+        )
+        store.db.commit()
+        panel = AuditPanelModel(store=store)
+        panel.show_all_events = True
+        panel.refresh()
+        info = panel.get_detail_info()
+        assert info is not None
+        assert info.event.structured == {}
+        assert ("Actor", "defenseclaw") in panel.detail_pairs()
+        assert "OpenClaw Agent" not in dict(panel.detail_pairs())
+    finally:
+        store.close()
 
 
 def test_audit_refresh_filter_selection_and_detail_enrichment(tmp_path) -> None:
