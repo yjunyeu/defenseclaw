@@ -219,11 +219,22 @@ func (c *OpenClawConnector) Teardown(ctx context.Context, opts SetupOpts) error 
 // installOpenClawExtension writes the embedded plugin files to
 // <ocHome>/extensions/defenseclaw and registers the plugin in
 // <ocHome>/openclaw.json. Idempotent: re-running leaves the config in the
-// same shape (single allow entry, single load path, enabled=true).
+// same shape (single allow entry, single load path, enabled=true). Skips
+// reinstall if the extension exists with all required dependencies.
 func installOpenClawExtension(ocHome string, enablePluginApprovals bool) error {
 	extDir := filepath.Join(ocHome, "extensions", "defenseclaw")
 	parentDir := filepath.Join(ocHome, "extensions")
+	configPath := filepath.Join(ocHome, "openclaw.json")
 
+	// Skip reinstall if extension exists with all required dependencies
+	if currentExtDirExists := dirExists(extDir); currentExtDirExists {
+		if hasRequiredDependencies(extDir) {
+			// Extension exists with complete dependencies, just ensure config is correct
+			return patchOpenClawConfig(configPath, extDir, enablePluginApprovals)
+		}
+	}
+
+	// Remove prior extension and write fresh from embedded tree
 	if err := safeRemoveAll(extDir, parentDir); err != nil {
 		return fmt.Errorf("remove prior extension: %w", err)
 	}
@@ -231,11 +242,27 @@ func installOpenClawExtension(ocHome string, enablePluginApprovals bool) error {
 		return fmt.Errorf("write plugin files: %w", err)
 	}
 
-	configPath := filepath.Join(ocHome, "openclaw.json")
-	if err := patchOpenClawConfig(configPath, extDir, enablePluginApprovals); err != nil {
-		return fmt.Errorf("patch openclaw.json: %w", err)
+	return patchOpenClawConfig(configPath, extDir, enablePluginApprovals)
+}
+
+// dirExists reports whether the given path exists on disk.
+func dirExists(path string) bool {
+	_, err := os.Lstat(path)
+	return !os.IsNotExist(err)
+}
+
+// hasRequiredDependencies reports whether the extension directory has all
+// runtime dependencies embedded in the plugin. These must match the lists
+// in the Makefile (sync-openclaw-extension, plugin-install, dist-plugin).
+func hasRequiredDependencies(extDir string) bool {
+	depDirs := []string{"js-yaml", "argparse", "undici"}
+	for _, dep := range depDirs {
+		depPath := filepath.Join(extDir, "node_modules", dep)
+		if _, err := os.Lstat(depPath); os.IsNotExist(err) {
+			return false
+		}
 	}
-	return nil
+	return true
 }
 
 // safeRemoveAll removes target only if it resolves to a path under parent.

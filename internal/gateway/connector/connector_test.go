@@ -1164,6 +1164,79 @@ func TestOpenClaw_Setup_IsIdempotent(t *testing.T) {
 	}
 }
 
+// TestOpenClaw_Setup_WithDependencies ensures that running Setup twice
+// does not remove the undici runtime dependency. The idempotency check
+// in installOpenClawExtension should skip reinstall if the extension
+// exists with all required dependencies.
+func TestOpenClaw_Setup_WithDependencies(t *testing.T) {
+	requireOpenClawExtensionBundle(t)
+
+	dir := t.TempDir()
+	ocHome := filepath.Join(dir, "openclaw-home")
+	os.MkdirAll(ocHome, 0o755)
+	configPath := filepath.Join(ocHome, "openclaw.json")
+	os.WriteFile(configPath, []byte(`{}`), 0o644)
+
+	OpenClawHomeOverride = ocHome
+	defer func() { OpenClawHomeOverride = "" }()
+
+	c := NewOpenClawConnector()
+	opts := SetupOpts{DataDir: dir, ProxyAddr: "127.0.0.1:4000", APIAddr: "127.0.0.1:18970"}
+
+	// First Setup should create the extension with dependencies
+	if err := c.Setup(context.Background(), opts); err != nil {
+		t.Fatalf("first Setup: %v", err)
+	}
+
+	// Verify undici exists after first Setup
+	extDir := filepath.Join(ocHome, "extensions", "defenseclaw")
+	undiciPath := filepath.Join(extDir, "node_modules", "undici")
+	if _, err := os.Lstat(undiciPath); os.IsNotExist(err) {
+		t.Fatalf("undici missing after first Setup")
+	}
+
+	// Record the timestamp of undici before second Setup
+	undiciInfo, err := os.Lstat(undiciPath)
+	if err != nil {
+		t.Fatalf("failed to stat undici: %v", err)
+	}
+	undiciModTime := undiciInfo.ModTime()
+
+	// Second Setup should NOT reinstall (idempotent) and should preserve undici
+	if err := c.Setup(context.Background(), opts); err != nil {
+		t.Fatalf("second Setup: %v", err)
+	}
+
+	// Verify undici still exists after second Setup
+	if _, err := os.Lstat(undiciPath); os.IsNotExist(err) {
+		t.Fatalf("undici missing after second Setup (reinstall occurred)")
+	}
+
+	// Verify undici was not recreated (timestamp should be same)
+	undiciInfo2, err := os.Lstat(undiciPath)
+	if err != nil {
+		t.Fatalf("failed to stat undici again: %v", err)
+	}
+	if undiciInfo2.ModTime() != undiciModTime {
+		t.Errorf("undici was recreated (modtime changed) - idempotency not working")
+	}
+}
+
+// TestOpenClaw_EmbeddedPluginHasUndici ensures the embedded OpenClaw plugin
+// includes undici as a runtime dependency. The plugin's client.js uses undici
+// for HTTP requests, and the Go gateway embeds the plugin at build time via
+// //go:embed. This test validates that sync-openclaw-extension and the
+// hardcoded dependency lists in the Makefile include undici.
+func TestOpenClaw_EmbeddedPluginHasUndici(t *testing.T) {
+	t.Parallel()
+	
+	// embed.FS always uses forward-slash paths
+	undiciPkgJSON := path.Join(openClawPluginRoot, "node_modules", "undici", "package.json")
+	if _, err := openClawExtensionFS.ReadFile(undiciPkgJSON); err != nil {
+		t.Fatalf("embedded plugin missing undici dependency at %s: %v", undiciPkgJSON, err)
+	}
+}
+
 func TestOpenClaw_Uninstall_RemovesAllDefenseClawLoadPaths(t *testing.T) {
 	dir := t.TempDir()
 	ocHome := filepath.Join(dir, "openclaw-home")

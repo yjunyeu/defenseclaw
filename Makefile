@@ -492,7 +492,7 @@ sync-openclaw-extension:
 	        cp "$$f" "../../../$$embed_dir/dist/$$f"; \
 	      done); \
 	fi; \
-	for dep in js-yaml argparse; do \
+	for dep in js-yaml argparse undici; do \
 	  if [ -d "$(PLUGIN_DIR)/node_modules/$$dep" ]; then \
 	    cp -R "$(PLUGIN_DIR)/node_modules/$$dep" "$$embed_dir/node_modules/"; \
 	  fi; \
@@ -689,7 +689,7 @@ plugin-install: _source-install-preflight gateway-install
 	@cp -r $(PLUGIN_DIR)/dist $(DC_EXT_DIR)/
 	@if [ -d $(PLUGIN_DIR)/node_modules ]; then \
 		mkdir -p $(DC_EXT_DIR)/node_modules; \
-		for dep in js-yaml argparse; do \
+		for dep in js-yaml argparse undici; do \
 			if [ -d $(PLUGIN_DIR)/node_modules/$$dep ]; then \
 				cp -r $(PLUGIN_DIR)/node_modules/$$dep $(DC_EXT_DIR)/node_modules/; \
 			fi; \
@@ -700,6 +700,14 @@ plugin-install: _source-install-preflight gateway-install
 		cp $(PLUGIN_DIR)/package.json $(OC_EXT_DIR)/; \
 		test -f $(PLUGIN_DIR)/openclaw.plugin.json && cp $(PLUGIN_DIR)/openclaw.plugin.json $(OC_EXT_DIR)/ || true; \
 		cp -r $(PLUGIN_DIR)/dist $(OC_EXT_DIR)/; \
+		if [ -d $(PLUGIN_DIR)/node_modules ]; then \
+			mkdir -p $(OC_EXT_DIR)/node_modules; \
+			for dep in js-yaml argparse undici; do \
+				if [ -d $(PLUGIN_DIR)/node_modules/$$dep ]; then \
+					cp -r $(PLUGIN_DIR)/node_modules/$$dep $(OC_EXT_DIR)/node_modules/; \
+				fi; \
+			done; \
+		fi; \
 		echo "Synced OpenClaw plugin to $(OC_EXT_DIR)"; \
 	fi
 	@echo "Installed OpenClaw plugin to $(DC_EXT_DIR)"
@@ -1271,7 +1279,7 @@ dist-plugin: _stage-extension-fingerprint
 	COPYFILE_DISABLE=1 tar -czf $(DIST_DIR)/defenseclaw-plugin-$(VERSION).tar.gz \
 		-C $(PLUGIN_DIR) \
 		package.json openclaw.plugin.json dist/ \
-		$$(cd $(PLUGIN_DIR) && for dep in js-yaml argparse; do \
+		$$(cd $(PLUGIN_DIR) && for dep in js-yaml argparse undici; do \
 			[ -d "node_modules/$$dep" ] && echo "node_modules/$$dep"; \
 		done)
 	"$(BOOTSTRAP_PYTHON)" scripts/extension_runtime_fingerprint.py verify-archive \
